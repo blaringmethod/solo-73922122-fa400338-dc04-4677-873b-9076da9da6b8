@@ -11,8 +11,6 @@ from pydantic import BaseModel
 from .config import MAX_CONCURRENT_ROUNDS, MAX_UPLOAD_BYTES, QUERY_TIMEOUT_SECONDS
 from .csv_io import CsvError, parse_observations_csv
 from .registry import (
-    CANCELLED,
-    FAILED,
     SUCCEEDED,
     RoundNotFound,
     RoundRegistry,
@@ -64,6 +62,9 @@ def health() -> dict:
         "active_rounds": registry.active_count(),
         "dataset_loaded": dataset is not None,
         "stations": dataset.stations if dataset else [],
+        "batch_id": dataset.batch_id if dataset else None,
+        "cache": registry.cache_stats(),
+        "executions": registry.execution_stats(),
     }
 
 
@@ -80,13 +81,18 @@ async def upload_csv(file: UploadFile = File(...)) -> dict:
     except CsvError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     dataset = store.replace(parsed, file.filename or "upload.csv")
+    # A new upload is a new batch version: results computed against the old
+    # CSV are no longer reusable. Finished rounds keep their own result bytes.
+    invalidated = registry.cache.invalidate_all()
     return {
         "filename": dataset.filename,
+        "batch_id": dataset.batch_id,
         "total_rows": dataset.total_rows,
         "stations": dataset.stations,
         "station_counts": {
             station: len(cols["station_id"]) for station, cols in dataset.by_station.items()
         },
+        "cache_invalidated": invalidated,
         "message": "上传成功，请选择站点并提交 SQL",
     }
 
@@ -101,18 +107,24 @@ async def create_round(submission: SqlSubmission) -> JSONResponse:
     except SqlRejected as exc:
         raise HTTPException(status_code=400, detail=f"SQL 校验失败：{exc}") from exc
 
-    columns = store.station_columns(station_id)
+    dataset = store.current()
+    if dataset is None:
+        raise HTTPException(status_code=409, detail="尚未上传观测 CSV，请先上传数据")
+    columns = dataset.by_station.get(station_id)
     if columns is None:
-        dataset = store.current()
-        if dataset is None:
-            raise HTTPException(status_code=409, detail="尚未上传观测 CSV，请先上传数据")
         raise HTTPException(
             status_code=404,
             detail=f"站点 {station_id!r} 不存在；可选站点：{dataset.stations}",
         )
 
     try:
-        round_obj = registry.submit(station_id, validated.text, columns)
+        round_obj = registry.submit(
+            station_id,
+            validated.text,
+            columns,
+            batch_id=dataset.batch_id,
+            sql_digest=validated.digest,
+        )
     except SlotsFullError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return JSONResponse(status_code=201, content=round_obj.public_dict())
@@ -120,7 +132,12 @@ async def create_round(submission: SqlSubmission) -> JSONResponse:
 
 @app.get("/api/rounds")
 def list_rounds() -> dict:
-    return {"rounds": registry.list_rounds(), "active": registry.active_count()}
+    return {
+        "rounds": registry.list_rounds(),
+        "active": registry.active_count(),
+        "cache": registry.cache_stats(),
+        "executions": registry.execution_stats(),
+    }
 
 
 @app.get("/api/rounds/{round_id}")

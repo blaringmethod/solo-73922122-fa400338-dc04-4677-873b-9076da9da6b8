@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import app, registry, store
+from app.main import app
 from app.registry import CANCELLED, FAILED, RUNNING, SUCCEEDED
 
 SAMPLE = Path(__file__).resolve().parent.parent / "sample_data" / "observations.csv"
@@ -15,14 +15,13 @@ SAMPLE = Path(__file__).resolve().parent.parent / "sample_data" / "observations.
 
 @pytest.fixture()
 def client():
-    # Each test starts from an empty registry and no uploaded dataset.
-    registry._rounds.clear()
-    store._dataset = None
+    # Each test starts from an empty registry, cache and no uploaded dataset.
+    from tests.conftest import _reset_app_state
+
+    _reset_app_state()
     with TestClient(app) as c:
         yield c
-    registry.shutdown()
-    registry._rounds.clear()
-    store._dataset = None
+    _reset_app_state()
 
 
 def _upload(client):
@@ -135,11 +134,14 @@ def test_unknown_station_404_and_no_upload_409(client):
 
 def test_two_parallel_rounds_and_third_rejected_503(client):
     _upload(client)
-    slow_sql = ("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 5000000) "
-                "SELECT count(*) FROM seq")
+    # Two *different* queries -> two distinct executions occupying both slots.
+    slow_sql_a = ("WITH RECURSIVE seq(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM seq WHERE x < 5000000) "
+                  "SELECT count(*) FROM seq")
+    slow_sql_b = ("WITH RECURSIVE seq(x) AS (SELECT 2 UNION ALL SELECT x+1 FROM seq WHERE x < 5000000) "
+                  "SELECT count(*) FROM seq")
     ids = []
-    for _ in range(2):
-        resp = client.post("/api/rounds", json={"station_id": "ST001", "sql": slow_sql})
+    for sql in (slow_sql_a, slow_sql_b):
+        resp = client.post("/api/rounds", json={"station_id": "ST001", "sql": sql})
         assert resp.status_code == 201, resp.text
         ids.append(resp.json()["round_id"])
     # Slots full.

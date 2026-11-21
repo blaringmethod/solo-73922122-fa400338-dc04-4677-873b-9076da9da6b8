@@ -7,3 +7,4 @@ tests
 .gitignore
 *.csv
 !sample_data/*.csv
+.deps

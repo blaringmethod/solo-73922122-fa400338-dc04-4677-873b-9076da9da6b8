@@ -11,6 +11,7 @@ Defence in depth:
 """
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -79,6 +80,10 @@ class SqlRejected(ValueError):
 @dataclass(frozen=True)
 class ValidatedSql:
     text: str
+    # Comment-free, whitespace-normalised form used for result-cache identity.
+    canonical: str
+    # SHA-256 of ``canonical``; the cache key stores only this digest.
+    digest: str
 
 
 def _strip_outer_comments(sql: str) -> str:
@@ -139,7 +144,17 @@ def validate_sql(sql: str) -> ValidatedSql:
     if ";" in compact:
         raise SqlRejected("statement must not contain multiple commands")
 
-    return ValidatedSql(text=sql.strip())
+    # Canonical form: comments removed and insignificant whitespace collapsed
+    # by sqlparse (string literals and quoted identifiers are preserved). Two
+    # submissions that differ only in formatting therefore share one cache
+    # entry, while any semantic change changes the digest.
+    canonical = sqlparse.format(
+        sql, strip_comments=True, strip_whitespace=True
+    ).strip()
+    if canonical.endswith(";"):
+        canonical = canonical[:-1].rstrip()
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return ValidatedSql(text=sql.strip(), canonical=canonical, digest=digest)
 
 
 def _first_keyword(stmt) -> str:

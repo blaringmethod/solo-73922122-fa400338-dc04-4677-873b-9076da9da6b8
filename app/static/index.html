@@ -50,6 +50,15 @@
   .pill.succeeded { background:rgba(34,197,94,.18); color:var(--ok); }
   .pill.failed { background:rgba(239,68,68,.18); color:var(--err); }
   .pill.cancelled { background:rgba(245,158,11,.18); color:var(--warn); }
+  .pill.waiting { background:rgba(167,139,250,.20); color:#c4b5fd; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:6px; font-size:11px;
+           font-weight:600; margin-left:6px; vertical-align:1px; }
+  .badge.hit { background:rgba(34,197,94,.20); color:#86efac; border:1px solid rgba(34,197,94,.5); }
+  .badge.shared { background:rgba(167,139,250,.20); color:#c4b5fd; border:1px solid rgba(167,139,250,.5); }
+  .badge.miss { background:rgba(148,163,184,.15); color:var(--muted); border:1px solid var(--line); }
+  .cachebar { display:flex; gap:16px; flex-wrap:wrap; font-size:12px; color:var(--muted);
+              margin-bottom:10px; padding:8px 12px; border:1px dashed var(--line); border-radius:8px; }
+  .cachebar b { color:var(--fg); }
   .limits { font-size:12px; color:var(--muted); display:grid; gap:4px;
             grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); margin-top:8px; }
   .limits b { color:var(--fg); }
@@ -67,8 +76,8 @@
 </head>
 <body>
 <header>
-  <h1>观测数据 SQL 清洗沙箱 <span style="font-size:12px;color:var(--muted)">FastAPI · DuckDB · 进程隔离</span></h1>
-  <p>外协清洗 SQL 试跑环境：每轮仅可见所选站点数据，只读 SELECT/WITH，独立沙箱执行。</p>
+  <h1>观测数据 SQL 清洗沙箱 <span style="font-size:12px;color:var(--muted)">FastAPI · DuckDB · 线程隔离 · 结果缓存</span></h1>
+  <p>外协清洗 SQL 试跑环境：每轮仅可见所选站点数据，只读 SELECT/WITH，独立沙箱执行。相同批次+站点+SQL 自动复用成功结果。</p>
 </header>
 <main>
   <section class="card">
@@ -86,7 +95,8 @@
       <span>并行名额：<b id="slotText">0 / 2</b></span>
       <span>单轮超时：<b>5 秒（硬终止）</b></span>
       <span>结果上限：<b>8 MiB（超限整轮失败）</b></span>
-      <span>隔离：<b>每轮独立子进程 + 独立内存库</b></span>
+      <span>当前批次：<b id="batchText">—</b></span>
+      <span>隔离：<b>每轮独立线程 + 独立内存库</b></span>
     </div>
   </section>
 
@@ -115,19 +125,26 @@
   </section>
 
   <section class="card">
-    <h2>③ 轮次状态 <span class="tag">可查询、可取消；成功后可下载结果 CSV</span></h2>
+    <h2>③ 轮次状态 <span class="tag">可查询、可取消；成功后可下载结果 CSV；缓存命中直接完成</span></h2>
+    <div class="cachebar">
+      <span>结果缓存：<b id="cacheEntries">0 / 8</b> 条</span>
+      <span>占用：<b id="cacheBytes">0.0 / 16.0 MiB</b></span>
+      <span>命中：<b id="cacheHits">0</b> / 未命中：<b id="cacheMisses">0</b></span>
+      <span>淘汰：<b id="cacheEvictions">0</b></span>
+      <span>规则：<b>仅完整成功结果 · 新 CSV 上传后全部失效 · 按近期使用淘汰</b></span>
+    </div>
     <div class="slotbar" style="margin-bottom:10px">
-      名额
+      执行名额
       <span class="slot" id="slot0"></span><span class="slot" id="slot1"></span>
       <span id="slotHint" style="color:var(--muted)"></span>
       <button class="ghost mini" id="autoBtn" style="margin-left:auto">自动刷新：开</button>
     </div>
     <table>
       <thead><tr>
-        <th>轮次</th><th>站点</th><th>状态</th><th>行数/大小</th>
+        <th>轮次</th><th>站点</th><th>状态</th><th>缓存</th><th>行数/大小</th>
         <th>耗时</th><th>说明 / 错误</th><th>操作</th>
       </tr></thead>
-      <tbody id="roundsBody"><tr><td colspan="7" style="color:var(--muted)">暂无轮次</td></tr></tbody>
+      <tbody id="roundsBody"><tr><td colspan="8" style="color:var(--muted)">暂无轮次</td></tr></tbody>
     </table>
   </section>
 </main>
@@ -174,9 +191,11 @@ $("uploadBtn").onclick = async () => {
     });
     sel.disabled = false;
     $("submitBtn").disabled = false;
+    $("batchText").textContent = "第 " + data.batch_id + " 批";
     showMsg($("uploadMsg"),
       "上传成功：" + data.filename + "，共 " + data.total_rows + " 行，" +
-      data.stations.length + " 个站点", "ok");
+      data.stations.length + " 个站点；已生成新批次（第 " + data.batch_id +
+      " 批），旧批次缓存已失效 " + data.cache_invalidated + " 条", "ok");
   } catch (e) {
     showMsg($("uploadMsg"), "上传失败：" + e.message, "err");
   } finally {
@@ -199,7 +218,10 @@ $("submitBtn").onclick = async () => {
       body: JSON.stringify({ station_id: $("station").value, sql })
     });
     showMsg($("submitMsg"), "已创建轮次 " + data.round_id.slice(0, 8) +
-      "，状态 " + data.state, "info");
+      "，状态 " + data.state +
+      (data.cache_hit ? "（命中缓存，直接完成）"
+        : data.shared_role === "waiter" ? "（等待相同的共享执行）" : ""),
+      "info");
     refreshRounds();
   } catch (e) {
     const kind = e.status === 503 ? "err" : "err";
@@ -236,25 +258,49 @@ async function refreshRounds() {
   $("slotText").textContent = active + " / 2";
   $("slot0").className = "slot" + (active >= 1 ? " busy" : "");
   $("slot1").className = "slot" + (active >= 2 ? " busy" : "");
-  $("slotHint").textContent = active >= 2 ? "（满额，新提交将被拒绝）" : "";
+  $("slotHint").textContent = active >= 2 ? "（满额，新执行将被拒绝）" : "";
+
+  const c = data.cache || {};
+  $("cacheEntries").textContent = (c.entries ?? 0) + " / " + (c.max_entries ?? 8);
+  $("cacheBytes").textContent =
+    ((c.bytes ?? 0) / 1048576).toFixed(1) + " / " +
+    ((c.max_bytes ?? 16777216) / 1048576).toFixed(1) + " MiB";
+  $("cacheHits").textContent = c.hits ?? 0;
+  $("cacheMisses").textContent = c.misses ?? 0;
+  $("cacheEvictions").textContent = c.evictions ?? 0;
 
   if (!data.rounds.length) {
-    body.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">暂无轮次</td></tr>';
+    body.innerHTML = '<tr><td colspan="8" style="color:var(--muted)">暂无轮次</td></tr>';
     return;
   }
   body.innerHTML = "";
   [...data.rounds].reverse().forEach((r) => {
     const tr = document.createElement("tr");
-    const running = r.state === "running" || r.state === "pending";
+    const running = r.state === "running" || r.state === "pending" || r.state === "waiting";
     const size = r.state === "succeeded"
       ? (r.row_count + " 行 / " + (r.result_bytes / 1024).toFixed(1) + " KiB")
       : "—";
-    const note = r.error || (r.cancel_requested && running ? "取消请求已受理，等待进程退出…" : "");
+    const note = r.error ||
+      (r.cancel_requested && running ? "取消请求已受理，等待共享执行退出…" : "");
+    let cacheCell;
+    if (r.cache_hit) {
+      cacheCell = '<span class="badge hit">命中</span>';
+    } else if (r.shared_role === "waiter") {
+      cacheCell = '<span class="badge shared">共享等待</span>';
+    } else if (r.shared_role === "initiator" && running) {
+      cacheCell = '<span class="badge miss">执行中</span>';
+    } else if (r.state === "succeeded") {
+      cacheCell = '<span class="badge miss">未命中→已缓存</span>';
+    } else {
+      cacheCell = '<span class="badge miss">未命中</span>';
+    }
+    const stateText = r.state +
+      (r.cancel_requested && running ? "（取消中）" : "");
     tr.innerHTML =
       "<td>" + r.round_id.slice(0, 8) + "</td>" +
       "<td>" + escapeHtml(r.station_id) + "</td>" +
-      '<td><span class="pill ' + r.state + '">' + r.state +
-      (r.cancel_requested && running ? "（取消中）" : "") + "</span></td>" +
+      '<td><span class="pill ' + r.state + '">' + stateText + "</span></td>" +
+      "<td>" + cacheCell + "</td>" +
       "<td>" + size + "</td>" +
       "<td>" + r.elapsed_ms + " ms</td>" +
       '<td class="err-text">' + escapeHtml(note) + "</td>" +
@@ -263,7 +309,10 @@ async function refreshRounds() {
     if (running) {
       const btn = document.createElement("button");
       btn.className = "danger mini";
-      btn.textContent = "取消";
+      btn.textContent = r.shared_role === "waiter" ? "取消本轮" : "取消";
+      btn.title = r.shared_role === "waiter"
+        ? "只取消本等待轮次，不影响共享执行"
+        : "取消执行（若有其他轮次在同一共享执行上，将只取消本轮）";
       btn.onclick = () => cancelRound(r.round_id);
       actionTd.appendChild(btn);
     } else if (r.state === "succeeded") {

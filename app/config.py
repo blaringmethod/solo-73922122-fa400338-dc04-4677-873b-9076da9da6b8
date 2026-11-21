@@ -25,8 +25,16 @@ TABLE_COLUMNS = ("station_id", "ts_utc", "temperature_c")
 # How many rows a worker pulls / serialises per batch.
 BATCH_SIZE = 2048
 
-# Keep finished round metadata even after their slots are released.
+# Keep finished round metadata even after their slots are released. Results of
+# finished rounds stay downloadable; both bounds are enforced so the 512 MiB
+# container limit cannot be exhausted by many large successful results.
 MAX_FINISHED_ROUNDS = 100
+MAX_RETAINED_RESULT_BYTES = 96 * 1024 * 1024  # across all finished rounds
+
+# Result cache: only complete, successful CSV results are kept. The cache is
+# bounded both by entry count and by the total size of the cached CSVs.
+MAX_CACHE_ENTRIES = 8
+MAX_CACHE_BYTES = 16 * 1024 * 1024  # 16 MiB across all cached result CSVs
 
 
 def env_int(name: str, default: int) -> int:

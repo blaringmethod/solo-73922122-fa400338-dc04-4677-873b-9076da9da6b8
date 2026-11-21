@@ -68,3 +68,27 @@ def test_rejected_queries_fail(sql):
 def test_length_limit():
     with pytest.raises(SqlRejected):
         validate_sql("SELECT " + "1," * 50_000)
+
+
+def test_canonical_form_ignores_comments_and_whitespace():
+    a = validate_sql("SELECT ts_utc, temperature_c FROM observations")
+    b = validate_sql(
+        "SELECT   ts_utc,  temperature_c  -- pick columns\n"
+        "FROM observations  "
+    )
+    assert a.canonical == b.canonical
+    assert a.digest == b.digest
+    # Any semantic change yields a different digest.
+    c = validate_sql("SELECT ts_utc, temperature_c + 1 FROM observations")
+    assert c.digest != a.digest
+
+
+def test_canonical_form_preserves_string_literals():
+    # String literals are case- and whitespace-sensitive, so they must not be
+    # normalised away by the cache key.
+    a = validate_sql("SELECT 'a  b' AS s")
+    b = validate_sql("SELECT 'a b' AS s")
+    assert a.digest != b.digest
+    c = validate_sql("SELECT 'ABC' AS s")
+    d = validate_sql("SELECT 'abc' AS s")
+    assert c.digest != d.digest
